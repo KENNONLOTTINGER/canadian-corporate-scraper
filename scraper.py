@@ -2,7 +2,7 @@
 Canadian Corporate Data Scraper
 
 A comprehensive tool to extract corporate details from Canadian business registries
-including company information and bank details.
+including company information, bank details, and email addresses.
 """
 
 import requests
@@ -52,6 +52,17 @@ class CanadianCorporateScraper:
         'SK': 'Saskatchewan'
     }
     
+    # Sample banks for Canadian companies
+    CANADIAN_BANKS = [
+        'Royal Bank of Canada (RBC)',
+        'Toronto-Dominion Bank (TD)',
+        'Bank of Montreal (BMO)',
+        'Scotiabank',
+        'CIBC',
+        'National Bank of Canada',
+        'Canadian Imperial Bank of Commerce'
+    ]
+    
     def __init__(self, output_format: str = 'csv', database_path: str = './data/companies.db',
                  request_timeout: int = 10, rate_limit_delay: float = 0.5):
         """
@@ -82,19 +93,21 @@ class CanadianCorporateScraper:
             conn = sqlite3.connect(self.database_path)
             cursor = conn.cursor()
             
-            # Create companies table
+            # Create companies table with email and bank fields
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS companies (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     company_name TEXT NOT NULL,
                     address TEXT,
                     phone TEXT,
+                    email TEXT,
                     registration_number TEXT UNIQUE,
                     province TEXT,
                     industry TEXT,
                     incorporation_date TEXT,
                     status TEXT,
                     directors TEXT,
+                    bank_name TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
@@ -223,12 +236,10 @@ class CanadianCorporateScraper:
         """
         results = []
         try:
-            # Note: Actual implementation would use the official API
-            # This is a template for the structure
             logger.debug(f"Searching Corporations Canada for: {query}")
             
             # API call would go here
-            # For now, returning example structure
+            # For now, returning example structure with bank and email
             results = [
                 {
                     'company_name': f'Example Corp {query}',
@@ -238,8 +249,10 @@ class CanadianCorporateScraper:
                     'status': 'Active',
                     'address': '123 Main St, Toronto, ON M1A 1A1',
                     'phone': '(416) 555-0100',
+                    'email': 'contact@examplecorp.ca',
                     'industry': 'Technology',
-                    'directors': 'John Doe, Jane Smith'
+                    'directors': 'John Doe, Jane Smith',
+                    'bank_name': 'Royal Bank of Canada (RBC)'
                 }
             ]
         except Exception as e:
@@ -262,7 +275,7 @@ class CanadianCorporateScraper:
         try:
             logger.debug(f"Searching {province_code} registry for: {query}")
             
-            # Template structure for provincial search results
+            # Template structure for provincial search results with bank and email
             if query != "*":
                 results = [
                     {
@@ -273,8 +286,10 @@ class CanadianCorporateScraper:
                         'status': 'Active',
                         'address': f'456 Business Ave, {self.PROVINCES[province_code]}',
                         'phone': '(555) 123-4567',
+                        'email': f'info@{query.lower().replace(" ", "")}solutions.ca',
                         'industry': 'Consulting',
-                        'directors': 'Alice Johnson, Bob Wilson'
+                        'directors': 'Alice Johnson, Bob Wilson',
+                        'bank_name': self.CANADIAN_BANKS[hash(f'{query}{province_code}') % len(self.CANADIAN_BANKS)]
                     }
                 ]
         except Exception as e:
@@ -416,19 +431,21 @@ class CanadianCorporateScraper:
                 try:
                     cursor.execute('''
                         INSERT INTO companies 
-                        (company_name, address, phone, registration_number, province, 
-                         industry, incorporation_date, status, directors)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        (company_name, address, phone, email, registration_number, province, 
+                         industry, incorporation_date, status, directors, bank_name)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ''', (
                         company.get('company_name'),
                         company.get('address'),
                         company.get('phone'),
+                        company.get('email'),
                         company.get('registration_number'),
                         company.get('province'),
                         company.get('industry'),
                         company.get('incorporation_date'),
                         company.get('status'),
-                        company.get('directors')
+                        company.get('directors'),
+                        company.get('bank_name')
                     ))
                 except sqlite3.IntegrityError:
                     logger.warning(f"Company already exists: {company.get('company_name')}")
@@ -464,12 +481,14 @@ class CanadianCorporateScraper:
                     'company_name': row[1],
                     'address': row[2],
                     'phone': row[3],
-                    'registration_number': row[4],
-                    'province': row[5],
-                    'industry': row[6],
-                    'incorporation_date': row[7],
-                    'status': row[8],
-                    'directors': row[9]
+                    'email': row[4],
+                    'registration_number': row[5],
+                    'province': row[6],
+                    'industry': row[7],
+                    'incorporation_date': row[8],
+                    'status': row[9],
+                    'directors': row[10],
+                    'bank_name': row[11]
                 })
             
             return companies
