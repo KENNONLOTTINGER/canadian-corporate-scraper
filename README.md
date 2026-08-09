@@ -57,6 +57,16 @@ results = scraper.search_by_province("ON")
 results = scraper.search_by_industry("Technology")
 ```
 
+### CLI
+
+```bash
+python3 scraper.py "Company Name" --province AB --business-type Technology --status Active --start-date 2020-01-01 --end-date 2024-12-31 --limit 2000
+```
+
+This command exports results to:
+- `output/companies_2k.csv`
+- `output/companies_2k.json`
+
 ### Export Data
 
 ```python
