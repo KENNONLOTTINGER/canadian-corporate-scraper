@@ -1,544 +1,462 @@
-"""
-Canadian Corporate Data Scraper - Extended Version
+"""Corporations Canada API scraper."""
 
-A comprehensive tool to extract corporate details from Canadian business registries
-including company information, bank details, and email addresses.
-Supports scraping 2000+ companies across all provinces.
-"""
-
-import requests
-import json
+import argparse
 import csv
+import json
 import logging
 import time
-from typing import List, Dict, Optional, Any
 from datetime import datetime
-from urllib.parse import urljoin, quote
-import sqlite3
 from pathlib import Path
-import random
+from typing import Any, Dict, List, Optional
 
-try:
-    import pandas as pd
-    from openpyxl import Workbook
-except ImportError:
-    pd = None
-    Workbook = None
+import requests
 
-# Configure logging
+
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
 
 
+OUTPUT_FIELDS = [
+    "company_name",
+    "registration_number",
+    "status",
+    "incorporation_date",
+    "address",
+    "province",
+    "phone",
+    "email",
+    "directors",
+    "industry",
+]
+
+
 class CanadianCorporateScraper:
-    """Main scraper class for Canadian corporate data - Extended to support 2000+ companies"""
-    
-    # Canadian federal and provincial APIs
-    CORPORATIONS_CANADA_API = "https://www.ic.gc.ca/app/scr/ccrael/new-eng"
-    ONTARIO_REGISTRY = "https://www.onbis.gov.on.ca/oBIS/"
-    
-    # Provincial codes
-    PROVINCES = {
-        'AB': 'Alberta',
-        'BC': 'British Columbia',
-        'MB': 'Manitoba',
-        'NB': 'New Brunswick',
-        'NL': 'Newfoundland and Labrador',
-        'NS': 'Nova Scotia',
-        'ON': 'Ontario',
-        'PE': 'Prince Edward Island',
-        'QC': 'Quebec',
-        'SK': 'Saskatchewan'
-    }
-    
-    # Canadian banks
-    CANADIAN_BANKS = [
-        'Royal Bank of Canada (RBC)',
-        'Toronto-Dominion Bank (TD)',
-        'Bank of Montreal (BMO)',
-        'Scotiabank',
-        'CIBC',
-        'National Bank of Canada',
-        'Canadian Imperial Bank of Commerce',
-        'Canadian Western Bank',
-        'Tangerine Bank',
-        'EQ Bank'
-    ]
-    
-    # Common Canadian company search terms
-    SEARCH_TERMS = [
-        'Technology', 'Consulting', 'Business', 'Solutions', 'Services',
-        'Group', 'Corporation', 'Ltd', 'Inc', 'Enterprise', 'Systems',
-        'Digital', 'Software', 'Data', 'Cloud', 'Network', 'Security',
-        'Finance', 'Capital', 'Investment', 'Trading', 'Energy',
-        'Construction', 'Development', 'Supply', 'Manufacturing',
-        'Healthcare', 'Medical', 'Pharma', 'Real Estate', 'Property',
-        'Retail', 'Distribution', 'Logistics', 'Transportation',
-        'Communications', 'Media', 'Publishing', 'Marketing',
-        'Education', 'Training', 'Consulting', 'Advisory'
-    ]
-    
-    def __init__(self, output_format: str = 'csv', database_path: str = './data/companies.db',
-                 request_timeout: int = 10, rate_limit_delay: float = 0.1, max_companies: int = 2000):
-        """
-        Initialize the scraper
-        
-        Args:
-            output_format: Default output format (csv, json, excel, sqlite)
-            database_path: Path to SQLite database
-            request_timeout: Timeout for API requests in seconds
-            rate_limit_delay: Delay between requests in seconds
-            max_companies: Maximum number of companies to scrape (default 2000)
-        """
-        self.output_format = output_format
-        self.database_path = database_path
+    """Scraper for real federal corporation data via Corporations Canada endpoints."""
+
+    SEARCH_API = (
+        "https://www.ic.gc.ca/app/scr/cc/CorporationsCanada/api/corporations/search.json"
+    )
+    DETAIL_API_TEMPLATE = (
+        "https://www.ic.gc.ca/app/scr/cc/CorporationsCanada/api/corporations/{corp_id}.json"
+    )
+
+    def __init__(
+        self,
+        output_dir: str = "./output",
+        request_timeout: int = 30,
+        rate_limit_delay: float = 0.5,
+        max_retries: int = 3,
+    ):
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
         self.request_timeout = request_timeout
         self.rate_limit_delay = rate_limit_delay
-        self.max_companies = max_companies
+        self.max_retries = max_retries
         self.session = requests.Session()
-        self.companies = []
-        self.total_scraped = 0
-        
-        # Create data directory if it doesn't exist
-        Path(self.database_path).parent.mkdir(parents=True, exist_ok=True)
-        
-        # Initialize database
-        self._init_database()
-    
-    def _init_database(self):
-        """Initialize SQLite database with required tables"""
-        try:
-            conn = sqlite3.connect(self.database_path)
-            cursor = conn.cursor()
-            
-            # Create companies table with email and bank fields
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS companies (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    company_name TEXT NOT NULL,
-                    address TEXT,
-                    phone TEXT,
-                    email TEXT,
-                    registration_number TEXT UNIQUE,
-                    province TEXT,
-                    industry TEXT,
-                    incorporation_date TEXT,
-                    status TEXT,
-                    directors TEXT,
-                    bank_name TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-            
-            # Create bank_details table
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS bank_details (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    company_id INTEGER,
-                    bank_name TEXT,
-                    account_type TEXT,
-                    account_status TEXT,
-                    routing_number TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY(company_id) REFERENCES companies(id)
-                )
-            ''')
-            
-            conn.commit()
-            conn.close()
-            logger.info(f"Database initialized at {self.database_path}")
-        except Exception as e:
-            logger.error(f"Error initializing database: {e}")
-    
-    def scrape_bulk_companies(self, limit: int = 2000) -> List[Dict]:
-        """
-        Scrape bulk companies from all provinces
-        
-        Args:
-            limit: Maximum number of companies to scrape
-        
-        Returns:
-            List of companies
-        """
-        logger.info(f"Starting bulk scrape for up to {limit} companies...")
-        all_companies = []
-        
-        try:
-            # Search each province with multiple search terms
-            for province_code, province_name in self.PROVINCES.items():
-                if len(all_companies) >= limit:
-                    break
-                
-                logger.info(f"Scraping {province_name}...")
-                
-                for search_term in self.SEARCH_TERMS:
-                    if len(all_companies) >= limit:
-                        break
-                    
-                    companies = self._scrape_province_companies(search_term, province_code)
-                    all_companies.extend(companies)
-                    
-                    # Remove duplicates
-                    seen = set()
-                    unique_companies = []
-                    for company in all_companies:
-                        reg_num = company.get('registration_number', '')
-                        if reg_num not in seen:
-                            seen.add(reg_num)
-                            unique_companies.append(company)
-                    all_companies = unique_companies[:limit]
-                    
-                    time.sleep(self.rate_limit_delay)
-                    
-                    logger.info(f"Total companies so far: {len(all_companies)}")
-            
-            self.companies = all_companies
-            self.total_scraped = len(all_companies)
-            logger.info(f"Successfully scraped {self.total_scraped} companies")
-            return all_companies
-        
-        except Exception as e:
-            logger.error(f"Error during bulk scrape: {e}")
-            return all_companies
-    
-    def _scrape_province_companies(self, search_term: str, province_code: str) -> List[Dict]:
-        """
-        Scrape companies from a specific province with a search term
-        
-        Args:
-            search_term: Search term to use
-            province_code: Province code
-        
-        Returns:
-            List of companies
-        """
-        companies = []
-        try:
-            # Generate 5-10 companies per search term per province
-            num_companies = random.randint(5, 10)
-            
-            for i in range(num_companies):
-                company = {
-                    'company_name': f'{search_term} {random.choice(["Inc", "Ltd", "Corp", "Solutions"])}',
-                    'registration_number': f'{province_code}{random.randint(1000000, 9999999)}',
-                    'province': province_code,
-                    'incorporation_date': f'{random.randint(2000, 2023)}-{random.randint(1, 12):02d}-{random.randint(1, 28):02d}',
-                    'status': 'Active',
-                    'address': f'{random.randint(1, 999)} {search_term} Ave, {self.PROVINCES[province_code]}',
-                    'phone': f'({random.randint(200, 999)}) {random.randint(100, 999)}-{random.randint(1000, 9999)}',
-                    'email': f'{search_term.lower().replace(" ", "")}@{random.choice(["ca", "com", "biz"])}.ca',
-                    'industry': search_term,
-                    'directors': f'{random.choice(["John", "Sarah", "Michael", "Jane"])} {random.choice(["Smith", "Johnson", "Williams", "Brown"])}, {random.choice(["Alice", "Bob", "Carol", "David"])} {random.choice(["Jones", "Garcia", "Miller", "Davis"])}',
-                    'bank_name': random.choice(self.CANADIAN_BANKS)
-                }
-                companies.append(company)
-        
-        except Exception as e:
-            logger.error(f"Error scraping {province_code}: {e}")
-        
-        return companies
-    
-    def search_by_name(self, company_name: str, province: Optional[str] = None) -> List[Dict]:
-        """
-        Search for companies by name
-        
-        Args:
-            company_name: Name of the company to search
-            province: Optional province code (e.g., 'ON', 'BC')
-        
-        Returns:
-            List of matching companies
-        """
-        logger.info(f"Searching for companies matching: {company_name}")
-        results = []
-        
-        try:
-            # Search all provinces
-            for prov_code in (self.PROVINCES.keys() if not province else [province]):
-                prov_results = self._search_provincial_registry(company_name, prov_code)
-                results.extend(prov_results)
+        self.companies: List[Dict[str, str]] = []
+
+    def _request_json(self, url: str, params: Optional[Dict[str, Any]] = None) -> Optional[Any]:
+        """GET JSON with retry, timeout, and rate limiting."""
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                response = self.session.get(url, params=params, timeout=self.request_timeout)
+                response.raise_for_status()
                 time.sleep(self.rate_limit_delay)
-            
-            logger.info(f"Found {len(results)} companies matching '{company_name}'")
-            self.companies = results
-            return results
-        
-        except Exception as e:
-            logger.error(f"Error searching by name: {e}")
+                return response.json()
+            except requests.RequestException as exc:
+                logger.warning(
+                    "Request failed (%s/%s) for %s: %s",
+                    attempt,
+                    self.max_retries,
+                    url,
+                    exc,
+                )
+                if attempt == self.max_retries:
+                    return None
+                time.sleep(self.rate_limit_delay * attempt)
+            except ValueError as exc:
+                logger.error("Invalid JSON from %s: %s", url, exc)
+                return None
+        return None
+
+    @staticmethod
+    def _pluck(payload: Dict[str, Any], keys: List[str]) -> str:
+        for key in keys:
+            value = payload.get(key)
+            if value:
+                return str(value).strip()
+        return ""
+
+    @staticmethod
+    def _flatten_name_entry(entry: Dict[str, Any]) -> str:
+        corporation_name = entry.get("CorporationName") if isinstance(entry, dict) else None
+        if isinstance(corporation_name, dict):
+            name = corporation_name.get("name") or corporation_name.get("Name")
+            if name:
+                return str(name).strip()
+        if isinstance(entry, dict):
+            name = entry.get("name") or entry.get("Name")
+            if name:
+                return str(name).strip()
+        return ""
+
+    @classmethod
+    def _extract_company_name(cls, payload: Dict[str, Any]) -> str:
+        names = payload.get("corporationNames")
+        if isinstance(names, list):
+            for entry in names:
+                name = cls._flatten_name_entry(entry)
+                if name:
+                    return name
+        return cls._pluck(payload, ["companyName", "name", "corporationName"])
+
+    @staticmethod
+    def _extract_address(payload: Dict[str, Any]) -> str:
+        address = payload.get("registeredOfficeAddress") or payload.get("address")
+        if not isinstance(address, dict):
+            return ""
+
+        parts = [
+            address.get("streetAddressLine1") or address.get("line1") or "",
+            address.get("streetAddressLine2") or address.get("line2") or "",
+            address.get("city") or "",
+            address.get("province") or address.get("provinceTerritory") or "",
+            address.get("postalCode") or "",
+        ]
+        cleaned = [str(part).strip() for part in parts if str(part).strip()]
+        return ", ".join(cleaned)
+
+    @staticmethod
+    def _extract_province(payload: Dict[str, Any]) -> str:
+        address = payload.get("registeredOfficeAddress") or payload.get("address")
+        if isinstance(address, dict):
+            province = address.get("province") or address.get("provinceTerritory")
+            if province:
+                return str(province).strip()
+        return ""
+
+    @staticmethod
+    def _extract_directors(payload: Dict[str, Any]) -> str:
+        directors = payload.get("directors")
+        if not isinstance(directors, list):
+            return ""
+
+        names: List[str] = []
+        for entry in directors:
+            director = entry.get("Director") if isinstance(entry, dict) else None
+            if not isinstance(director, dict):
+                director = entry if isinstance(entry, dict) else {}
+            first = str(director.get("firstName") or "").strip()
+            last = str(director.get("lastName") or "").strip()
+            full_name = f"{first} {last}".strip()
+            if full_name:
+                names.append(full_name)
+        return "; ".join(names)
+
+    @staticmethod
+    def _normalize_date(date_value: str) -> str:
+        if not date_value:
+            return ""
+        candidate = str(date_value).strip()
+        for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y", "%Y-%m-%dT%H:%M:%S"):
+            try:
+                return datetime.strptime(candidate, fmt).strftime("%Y-%m-%d")
+            except ValueError:
+                continue
+        return candidate
+
+    @staticmethod
+    def _within_date_range(
+        incorporation_date: str,
+        start_date: Optional[str],
+        end_date: Optional[str],
+    ) -> bool:
+        if not incorporation_date:
+            return not start_date and not end_date
+        try:
+            value = datetime.strptime(incorporation_date, "%Y-%m-%d")
+        except ValueError:
+            return False
+
+        if start_date:
+            try:
+                if value < datetime.strptime(start_date, "%Y-%m-%d"):
+                    return False
+            except ValueError:
+                return False
+        if end_date:
+            try:
+                if value > datetime.strptime(end_date, "%Y-%m-%d"):
+                    return False
+            except ValueError:
+                return False
+        return True
+
+    def _extract_company(self, payload: Dict[str, Any]) -> Dict[str, str]:
+        incorporation_date = self._normalize_date(
+            self._pluck(payload, ["dateOfIncorporation", "incorporationDate", "createdDate"])
+        )
+
+        return {
+            "company_name": self._extract_company_name(payload),
+            "registration_number": self._pluck(
+                payload,
+                ["corporationId", "corporationNumber", "businessNumber", "registrationNumber"],
+            ),
+            "status": self._pluck(payload, ["status", "corporationStatus"]) or "Unknown",
+            "incorporation_date": incorporation_date,
+            "address": self._extract_address(payload),
+            "province": self._extract_province(payload),
+            "phone": self._pluck(payload, ["phone", "phoneNumber", "contactPhone"]),
+            "email": self._pluck(payload, ["email", "contactEmail"]),
+            "directors": self._extract_directors(payload),
+            "industry": self._pluck(payload, ["industry", "businessType", "primaryActivity"]),
+        }
+
+    @staticmethod
+    def _extract_search_results(payload: Any) -> List[Dict[str, Any]]:
+        if isinstance(payload, dict):
+            for key in ("results", "corporations", "items", "data"):
+                rows = payload.get(key)
+                if isinstance(rows, list):
+                    return rows
             return []
-    
-    def search_by_province(self, province_code: str) -> List[Dict]:
-        """
-        Search for companies by province
-        
-        Args:
-            province_code: Province code (e.g., 'ON', 'BC')
-        
-        Returns:
-            List of companies in the province
-        """
-        logger.info(f"Searching for companies in {self.PROVINCES.get(province_code, province_code)}")
-        
-        try:
-            results = self._search_provincial_registry("*", province_code)
-            logger.info(f"Found {len(results)} companies in {province_code}")
-            self.companies = results
-            return results
-        except Exception as e:
-            logger.error(f"Error searching by province: {e}")
-            return []
-    
-    def search_by_industry(self, industry: str) -> List[Dict]:
-        """
-        Search for companies by industry
-        
-        Args:
-            industry: Industry classification or keyword
-        
-        Returns:
-            List of companies in the industry
-        """
-        logger.info(f"Searching for companies in industry: {industry}")
-        
-        try:
-            results = []
-            for prov_code in self.PROVINCES.keys():
-                prov_results = self._search_provincial_registry(industry, prov_code)
-                results.extend(prov_results)
-                time.sleep(self.rate_limit_delay)
-            
-            filtered_results = [
-                r for r in results 
-                if industry.lower() in r.get('industry', '').lower()
-            ]
-            
-            logger.info(f"Found {len(filtered_results)} companies in {industry}")
-            self.companies = filtered_results
-            return filtered_results
-        except Exception as e:
-            logger.error(f"Error searching by industry: {e}")
-            return []
-    
-    def _search_provincial_registry(self, query: str, province_code: str) -> List[Dict]:
-        """
-        Search provincial business registry
-        
-        Args:
-            query: Search query
-            province_code: Province code
-        
-        Returns:
-            List of matching companies
-        """
-        results = []
-        try:
-            logger.debug(f"Searching {province_code} registry for: {query}")
-            
-            if query != "*":
-                results = [
-                    {
-                        'company_name': f'{query} Solutions Ltd',
-                        'registration_number': f'{province_code}1234567',
-                        'province': province_code,
-                        'incorporation_date': '2021-03-20',
-                        'status': 'Active',
-                        'address': f'456 Business Ave, {self.PROVINCES[province_code]}',
-                        'phone': '(555) 123-4567',
-                        'email': f'info@{query.lower().replace(" ", "")}solutions.ca',
-                        'industry': 'Consulting',
-                        'directors': 'Alice Johnson, Bob Wilson',
-                        'bank_name': self.CANADIAN_BANKS[hash(f'{query}{province_code}') % len(self.CANADIAN_BANKS)]
-                    }
-                ]
-        except Exception as e:
-            logger.error(f"Error searching {province_code} registry: {e}")
-        
-        return results
-    
-    def export_to_csv(self, companies: Optional[List[Dict]] = None, filename: str = 'companies.csv'):
-        """Export companies to CSV file"""
-        try:
-            data = companies or self.companies
-            
-            if not data:
-                logger.warning("No companies to export")
-                return
-            
-            with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
-                fieldnames = data[0].keys()
-                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-                
-                writer.writeheader()
-                writer.writerows(data)
-            
-            logger.info(f"Exported {len(data)} companies to {filename}")
-        
-        except Exception as e:
-            logger.error(f"Error exporting to CSV: {e}")
-    
-    def export_to_json(self, companies: Optional[List[Dict]] = None, filename: str = 'companies.json'):
-        """Export companies to JSON file"""
-        try:
-            data = companies or self.companies
-            
-            if not data:
-                logger.warning("No companies to export")
-                return
-            
-            with open(filename, 'w', encoding='utf-8') as jsonfile:
-                json.dump(data, jsonfile, indent=2, ensure_ascii=False)
-            
-            logger.info(f"Exported {len(data)} companies to {filename}")
-        
-        except Exception as e:
-            logger.error(f"Error exporting to JSON: {e}")
-    
-    def export_to_excel(self, companies: Optional[List[Dict]] = None, filename: str = 'companies.xlsx'):
-        """Export companies to Excel file"""
-        try:
-            if pd is None:
-                logger.error("pandas is required for Excel export. Install it with: pip install pandas openpyxl")
-                return
-            
-            data = companies or self.companies
-            
-            if not data:
-                logger.warning("No companies to export")
-                return
-            
-            df = pd.DataFrame(data)
-            df.to_excel(filename, index=False, sheet_name='Companies')
-            
-            logger.info(f"Exported {len(data)} companies to {filename}")
-        
-        except Exception as e:
-            logger.error(f"Error exporting to Excel: {e}")
-    
-    def save_to_database(self, companies: Optional[List[Dict]] = None):
-        """Save companies to SQLite database"""
-        try:
-            data = companies or self.companies
-            
-            if not data:
-                logger.warning("No companies to save")
-                return
-            
-            conn = sqlite3.connect(self.database_path)
-            cursor = conn.cursor()
-            
-            for company in data:
-                try:
-                    cursor.execute('''
-                        INSERT INTO companies 
-                        (company_name, address, phone, email, registration_number, province, 
-                         industry, incorporation_date, status, directors, bank_name)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ''', (
-                        company.get('company_name'),
-                        company.get('address'),
-                        company.get('phone'),
-                        company.get('email'),
-                        company.get('registration_number'),
-                        company.get('province'),
-                        company.get('industry'),
-                        company.get('incorporation_date'),
-                        company.get('status'),
-                        company.get('directors'),
-                        company.get('bank_name')
-                    ))
-                except sqlite3.IntegrityError:
+        if isinstance(payload, list):
+            return [row for row in payload if isinstance(row, dict)]
+        return []
+
+    @staticmethod
+    def _extract_corporation_id(item: Dict[str, Any]) -> str:
+        for key in (
+            "corporationId",
+            "corporation_id",
+            "corporationNumber",
+            "businessNumber",
+            "id",
+        ):
+            value = item.get(key)
+            if value:
+                return str(value).strip()
+        return ""
+
+    def _fetch_company_detail(self, corporation_id: str) -> Optional[Dict[str, Any]]:
+        url = self.DETAIL_API_TEMPLATE.format(corp_id=corporation_id)
+        payload = self._request_json(url, params={"lang": "eng"})
+        if payload is None:
+            return None
+
+        if isinstance(payload, list):
+            for item in payload:
+                if isinstance(item, dict):
+                    return item
+            return None
+
+        return payload if isinstance(payload, dict) else None
+
+    @staticmethod
+    def _matches_filters(
+        company: Dict[str, str],
+        province: Optional[str],
+        business_type: Optional[str],
+        status: Optional[str],
+        start_date: Optional[str],
+        end_date: Optional[str],
+    ) -> bool:
+        if province and company.get("province", "").upper() != province.upper():
+            return False
+
+        if business_type:
+            industry = company.get("industry", "")
+            if business_type.lower() not in industry.lower():
+                return False
+
+        if status and company.get("status", "").lower() != status.lower():
+            return False
+
+        if not CanadianCorporateScraper._within_date_range(
+            company.get("incorporation_date", ""), start_date, end_date
+        ):
+            return False
+
+        return True
+
+    def search_companies(
+        self,
+        company_name: str,
+        province: Optional[str] = None,
+        business_type: Optional[str] = None,
+        status: Optional[str] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        limit: int = 2000,
+        page_size: int = 100,
+    ) -> List[Dict[str, str]]:
+        """Search Corporations Canada and collect up to *limit* company records."""
+        logger.info("Starting company search for '%s' (limit=%s)", company_name, limit)
+        companies: List[Dict[str, str]] = []
+        seen_ids = set()
+        page = 1
+
+        while len(companies) < limit:
+            params = {
+                "lang": "eng",
+                "q": company_name,
+                "page": page,
+                "size": page_size,
+            }
+            if province:
+                params["province"] = province.upper()
+            if business_type:
+                params["businessType"] = business_type
+            if status:
+                params["status"] = status
+            if start_date:
+                params["fromDate"] = start_date
+            if end_date:
+                params["toDate"] = end_date
+
+            search_payload = self._request_json(self.SEARCH_API, params=params)
+            if search_payload is None:
+                logger.error("Search request failed; stopping collection.")
+                break
+
+            search_results = self._extract_search_results(search_payload)
+            if not search_results:
+                logger.info("No more search results at page %s", page)
+                break
+
+            for item in search_results:
+                corp_id = self._extract_corporation_id(item)
+                if not corp_id or corp_id in seen_ids:
                     continue
-            
-            conn.commit()
-            conn.close()
-            
-            logger.info(f"Saved {len(data)} companies to database")
-        
-        except Exception as e:
-            logger.error(f"Error saving to database: {e}")
-    
-    def get_all_companies(self) -> List[Dict]:
-        """Retrieve all companies from database"""
-        try:
-            conn = sqlite3.connect(self.database_path)
-            cursor = conn.cursor()
-            
-            cursor.execute('SELECT * FROM companies')
-            results = cursor.fetchall()
-            conn.close()
-            
-            companies = []
-            for row in results:
-                companies.append({
-                    'id': row[0],
-                    'company_name': row[1],
-                    'address': row[2],
-                    'phone': row[3],
-                    'email': row[4],
-                    'registration_number': row[5],
-                    'province': row[6],
-                    'industry': row[7],
-                    'incorporation_date': row[8],
-                    'status': row[9],
-                    'directors': row[10],
-                    'bank_name': row[11]
-                })
-            
-            return companies
-        
-        except Exception as e:
-            logger.error(f"Error retrieving all companies: {e}")
-            return []
-    
-    def clear_database(self):
-        """Clear all data from database"""
-        try:
-            conn = sqlite3.connect(self.database_path)
-            cursor = conn.cursor()
-            
-            cursor.execute('DELETE FROM bank_details')
-            cursor.execute('DELETE FROM companies')
-            
-            conn.commit()
-            conn.close()
-            
-            logger.info("Database cleared")
-        
-        except Exception as e:
-            logger.error(f"Error clearing database: {e}")
+
+                detail_payload = self._fetch_company_detail(corp_id)
+                if not detail_payload:
+                    continue
+
+                company = self._extract_company(detail_payload)
+                if not company.get("company_name"):
+                    continue
+
+                if not self._matches_filters(
+                    company,
+                    province=province,
+                    business_type=business_type,
+                    status=status,
+                    start_date=start_date,
+                    end_date=end_date,
+                ):
+                    continue
+
+                seen_ids.add(corp_id)
+                companies.append(company)
+
+                if len(companies) % 50 == 0 or len(companies) == limit:
+                    logger.info("Collected %s/%s companies", len(companies), limit)
+
+                if len(companies) >= limit:
+                    break
+
+            page += 1
+
+        self.companies = companies
+        logger.info("Finished. Collected %s companies.", len(companies))
+        return companies
+
+    # compatibility wrappers
+    def search_by_name(self, company_name: str, province: Optional[str] = None) -> List[Dict[str, str]]:
+        return self.search_companies(company_name=company_name, province=province, limit=2000)
+
+    def search_by_province(self, province_code: str) -> List[Dict[str, str]]:
+        return self.search_companies(company_name="", province=province_code, limit=2000)
+
+    def search_by_industry(self, industry: str) -> List[Dict[str, str]]:
+        return self.search_companies(company_name="", business_type=industry, limit=2000)
+
+    def scrape_bulk_companies(self, limit: int = 2000) -> List[Dict[str, str]]:
+        return self.search_companies(company_name="", limit=limit)
+
+    def export_to_csv(
+        self, companies: Optional[List[Dict[str, str]]] = None, filename: str = "companies_2k.csv"
+    ) -> str:
+        data = companies if companies is not None else self.companies
+        if not data:
+            logger.warning("No companies to export to CSV")
+            return ""
+
+        out_path = self.output_dir / filename
+        with open(out_path, "w", newline="", encoding="utf-8") as csv_file:
+            writer = csv.DictWriter(csv_file, fieldnames=OUTPUT_FIELDS, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(data)
+        logger.info("Saved CSV: %s", out_path)
+        return str(out_path)
+
+    def export_to_json(
+        self, companies: Optional[List[Dict[str, str]]] = None, filename: str = "companies_2k.json"
+    ) -> str:
+        data = companies if companies is not None else self.companies
+        if not data:
+            logger.warning("No companies to export to JSON")
+            return ""
+
+        out_path = self.output_dir / filename
+        with open(out_path, "w", encoding="utf-8") as json_file:
+            json.dump(data, json_file, indent=2, ensure_ascii=False)
+        logger.info("Saved JSON: %s", out_path)
+        return str(out_path)
 
 
-def main():
-    """Example usage"""
-    scraper = CanadianCorporateScraper(max_companies=2000)
-    
-    print("=" * 60)
-    print("SCRAPING 2000+ CANADIAN COMPANIES")
-    print("=" * 60)
-    
-    # Scrape bulk companies
-    results = scraper.scrape_bulk_companies(limit=2000)
-    
-    print(f"\nScraped {len(results)} companies total")
-    
-    # Export to different formats
-    scraper.export_to_csv(results, 'output/bulk_companies.csv')
-    scraper.export_to_json(results, 'output/bulk_companies.json')
-    scraper.export_to_excel(results, 'output/bulk_companies.xlsx')
-    
-    # Save to database
-    scraper.save_to_database(results)
-    
-    print(f"\n✓ Successfully scraped and exported {len(results)} companies!")
-    print("Files saved:")
-    print("  - output/bulk_companies.csv")
-    print("  - output/bulk_companies.json")
-    print("  - output/bulk_companies.xlsx")
-    print("  - data/companies.db")
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Scrape real federal corporations from Corporations Canada API"
+    )
+    parser.add_argument("company_name", help="Company name or keyword to search")
+    parser.add_argument("--province", help="Province filter (e.g. AB)")
+    parser.add_argument("--business-type", help="Business type/industry filter")
+    parser.add_argument("--status", help="Status filter (e.g. Active, Dissolved)")
+    parser.add_argument("--start-date", help="Incorporation start date (YYYY-MM-DD)")
+    parser.add_argument("--end-date", help="Incorporation end date (YYYY-MM-DD)")
+    parser.add_argument("--limit", type=int, default=2000, help="Number of records to collect")
+    parser.add_argument("--output-dir", default="./output", help="Output directory")
+    parser.add_argument("--request-timeout", type=int, default=30, help="HTTP timeout seconds")
+    parser.add_argument(
+        "--rate-limit-delay",
+        type=float,
+        default=0.5,
+        help="Delay between API calls in seconds",
+    )
+
+    args = parser.parse_args()
+
+    scraper = CanadianCorporateScraper(
+        output_dir=args.output_dir,
+        request_timeout=args.request_timeout,
+        rate_limit_delay=args.rate_limit_delay,
+    )
+
+    companies = scraper.search_companies(
+        company_name=args.company_name,
+        province=args.province,
+        business_type=args.business_type,
+        status=args.status,
+        start_date=args.start_date,
+        end_date=args.end_date,
+        limit=args.limit,
+    )
+
+    csv_path = scraper.export_to_csv(companies, "companies_2k.csv")
+    json_path = scraper.export_to_json(companies, "companies_2k.json")
+
+    print(f"Collected {len(companies)} companies")
+    if csv_path:
+        print(f"CSV: {csv_path}")
+    if json_path:
+        print(f"JSON: {json_path}")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
