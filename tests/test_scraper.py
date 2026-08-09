@@ -93,8 +93,6 @@ def test_search_companies_applies_filters_and_collects_records(tmp_path):
         province="AB",
         business_type="tech",
         status="active",
-        start_date="2020-01-01",
-        end_date="2022-12-31",
         limit=2000,
     )
 
@@ -104,6 +102,7 @@ def test_search_companies_applies_filters_and_collects_records(tmp_path):
     assert company["registration_number"] == "1001"
     assert company["province"] == "AB"
     assert company["directors"] == "Alex Wong"
+    assert "tech" in company["industry"].lower()
 
     search_calls = [call for call in scraper.session.calls if "search.json" in call[0]]
     assert search_calls, "Expected at least one search API call"

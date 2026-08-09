@@ -285,7 +285,7 @@ class CanadianCorporateScraper:
 
     def search_companies(
         self,
-        company_name: str,
+        company_name: Optional[str] = None,
         province: Optional[str] = None,
         business_type: Optional[str] = None,
         status: Optional[str] = None,
@@ -295,18 +295,15 @@ class CanadianCorporateScraper:
         page_size: int = 100,
     ) -> List[Dict[str, str]]:
         """Search Corporations Canada and collect up to *limit* company records."""
-        logger.info("Starting company search for '%s' (limit=%s)", company_name, limit)
+        logger.info("Starting company search for '%s' (limit=%s)", company_name or "*", limit)
         companies: List[Dict[str, str]] = []
         seen_ids = set()
         page = 1
 
         while len(companies) < limit:
-            params = {
-                "lang": "eng",
-                "q": company_name,
-                "page": page,
-                "size": page_size,
-            }
+            params = {"lang": "eng", "page": page, "size": page_size}
+            if company_name:
+                params["q"] = company_name
             if province:
                 params["province"] = province.upper()
             if business_type:
@@ -332,6 +329,7 @@ class CanadianCorporateScraper:
                 corp_id = self._extract_corporation_id(item)
                 if not corp_id or corp_id in seen_ids:
                     continue
+                seen_ids.add(corp_id)
 
                 detail_payload = self._fetch_company_detail(corp_id)
                 if not detail_payload:
@@ -351,7 +349,6 @@ class CanadianCorporateScraper:
                 ):
                     continue
 
-                seen_ids.add(corp_id)
                 companies.append(company)
 
                 if len(companies) % 50 == 0 or len(companies) == limit:
@@ -371,13 +368,13 @@ class CanadianCorporateScraper:
         return self.search_companies(company_name=company_name, province=province, limit=2000)
 
     def search_by_province(self, province_code: str) -> List[Dict[str, str]]:
-        return self.search_companies(company_name="", province=province_code, limit=2000)
+        return self.search_companies(company_name=None, province=province_code, limit=2000)
 
     def search_by_industry(self, industry: str) -> List[Dict[str, str]]:
-        return self.search_companies(company_name="", business_type=industry, limit=2000)
+        return self.search_companies(company_name=None, business_type=industry, limit=2000)
 
     def scrape_bulk_companies(self, limit: int = 2000) -> List[Dict[str, str]]:
-        return self.search_companies(company_name="", limit=limit)
+        return self.search_companies(company_name=None, limit=limit)
 
     def export_to_csv(
         self, companies: Optional[List[Dict[str, str]]] = None, filename: str = "companies_2k.csv"
@@ -414,7 +411,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Scrape real federal corporations from Corporations Canada API"
     )
-    parser.add_argument("company_name", help="Company name or keyword to search")
+    parser.add_argument(
+        "company_name",
+        nargs="?",
+        default=None,
+        help="Company name or keyword to search",
+    )
     parser.add_argument("--province", help="Province filter (e.g. AB)")
     parser.add_argument("--business-type", help="Business type/industry filter")
     parser.add_argument("--status", help="Status filter (e.g. Active, Dissolved)")
