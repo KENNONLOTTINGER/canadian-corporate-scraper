@@ -294,18 +294,20 @@ class SimplyHiredJobScraper:
             List of unique companies with addresses
         """
         data = jobs or self.jobs
-        companies = []
-        seen_companies = set()
+        companies_by_key = {}
         
         for job in data:
-            company_key = (job.get('company_name', ''), job.get('address', ''))
+            company_name = job.get('company_name')
+            if not company_name:
+                continue
             
-            if company_key not in seen_companies and job.get('company_name'):
-                seen_companies.add(company_key)
-                
-                company = {
-                    'company_name': job.get('company_name'),
-                    'address': job.get('address'),
+            address = job.get('address') or ''
+            key = (company_name, address)
+            
+            if key not in companies_by_key:
+                companies_by_key[key] = {
+                    'company_name': company_name,
+                    'address': address,
                     'province': job.get('province', 'ON'),
                     'country': 'Canada',
                     'open_positions': 1,
@@ -313,16 +315,16 @@ class SimplyHiredJobScraper:
                     'industries': 'Transportation/Logistics',
                     'source': 'SimplyHired Canada'
                 }
-                companies.append(company)
             else:
-                # Increment open positions count
-                for comp in companies:
-                    if (comp['company_name'] == job.get('company_name') and 
-                        comp['address'] == job.get('address')):
-                        comp['open_positions'] += 1
-                        break
+                companies_by_key[key]['open_positions'] += 1
+                
+                current_date = job.get('posted_date')
+                if current_date:
+                    last_posting_date = companies_by_key[key].get('last_posting_date')
+                    if not last_posting_date or current_date > last_posting_date:
+                        companies_by_key[key]['last_posting_date'] = current_date
         
-        return companies
+        return list(companies_by_key.values())
 
 
 def main():
