@@ -5,10 +5,12 @@ Tests for csv_scraper.py – Canadian Corporate CSV Data Processor
 import csv
 import json
 import os
+from unittest.mock import MagicMock, patch
 import pytest
 
 from csv_scraper import (
     CSVDataScraper,
+    RBC_NAME_KEYWORDS,
     _normalise_province,
     _normalise_status,
     _clean_text,
@@ -352,3 +354,146 @@ class TestConfig:
             assert 'url' in src, f"Missing 'url' in {name}"
             assert 'description' in src, f"Missing 'description' in {name}"
             assert 'column_map' in src, f"Missing 'column_map' in {name}"
+
+
+# ---------------------------------------------------------------------------
+# RBC online fetch tests (network calls are mocked)
+# ---------------------------------------------------------------------------
+
+# Minimal CSV whose rows exercise RBC detection via company name and bank field
+RBC_SAMPLE_CSV = (
+    "Corporation Name,Corporation Number,Status,Date of Incorporation,"
+    "Province / Territory,Registered Office Address,Phone,Email,Industry,Directors,Bank Name\n"
+    "Royal Bank of Canada,1000001,Active,1869-01-01,ON,"
+    "200 Bay St Toronto ON,4165550001,info@rbc.com,Banking,John Smith,\n"
+    "RBC Capital Markets,1000002,Active,2001-03-15,ON,"
+    "200 Bay St Toronto ON,4165550002,cm@rbc.com,Finance,Jane Doe,\n"
+    "TD Bank Group,2000001,Active,1955-06-01,ON,"
+    "66 Wellington St W Toronto ON,4165550003,info@td.com,Banking,Bob Lee,TD Bank\n"
+)
+
+
+class TestRBCFetch:
+    """Tests for fetch_rbc_data() and run_rbc() using mocked HTTP calls."""
+
+    @pytest.fixture
+    def scraper(self, tmp_path):
+        return CSVDataScraper(output_dir=str(tmp_path / "output"), max_records=2000)
+
+    def _mock_ckan_response(self, csv_url: str) -> MagicMock:
+        """Return a mock for the CKAN package API that points to *csv_url*."""
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {
+            "result": {
+                "resources": [
+                    {"format": "CSV", "url": csv_url},
+                ]
+            }
+        }
+        return mock_resp
+
+    def _mock_csv_response(self, csv_text: str) -> MagicMock:
+        """Return a mock for the CSV download response."""
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.headers = {"Content-Type": "text/csv"}
+        mock_resp.text = csv_text
+        return mock_resp
+
+    def test_rbc_name_keywords_defined(self):
+        assert "rbc" in RBC_NAME_KEYWORDS
+        assert "royal bank of canada" in RBC_NAME_KEYWORDS
+
+    def test_is_rbc_record_by_name(self, scraper):
+        assert scraper._is_rbc_record({"company_name": "Royal Bank of Canada", "bank_name": ""})
+        assert scraper._is_rbc_record({"company_name": "RBC Capital Markets", "bank_name": ""})
+
+    def test_is_rbc_record_by_bank_field(self, scraper):
+        assert scraper._is_rbc_record({"company_name": "Acme Corp", "bank_name": "RBC"})
+
+    def test_is_rbc_record_false_for_others(self, scraper):
+        assert not scraper._is_rbc_record({"company_name": "TD Bank Group", "bank_name": "TD"})
+
+    def test_fetch_rbc_data_returns_only_rbc_records(self, scraper, tmp_path):
+        fake_csv_url = "https://fake.example.com/corps.csv"
+
+        def side_effect(url, **kwargs):
+            if "package_show" in url:
+                return self._mock_ckan_response(fake_csv_url)
+            if url == fake_csv_url:
+                return self._mock_csv_response(RBC_SAMPLE_CSV)
+            raise ValueError(f"Unexpected URL: {url}")
+
+        with patch("csv_scraper.requests.get", side_effect=side_effect):
+            results = scraper.fetch_rbc_data(max_records=800)
+
+        assert len(results) == 2  # Royal Bank + RBC Capital; TD excluded
+        names = [r["company_name"] for r in results]
+        assert "Royal Bank of Canada" in names
+        assert "RBC Capital Markets" in names
+        assert not any("TD" in n for n in names)
+
+    def test_fetch_rbc_data_respects_max_records(self, scraper):
+        fake_csv_url = "https://fake.example.com/corps.csv"
+
+        def side_effect(url, **kwargs):
+            if "package_show" in url:
+                return self._mock_ckan_response(fake_csv_url)
+            return self._mock_csv_response(RBC_SAMPLE_CSV)
+
+        with patch("csv_scraper.requests.get", side_effect=side_effect):
+            results = scraper.fetch_rbc_data(max_records=1)
+
+        assert len(results) == 1
+
+    def test_fetch_rbc_data_returns_empty_on_network_error(self, scraper):
+        import requests as req_lib
+
+        with patch("csv_scraper.requests.get", side_effect=req_lib.RequestException("timeout")):
+            results = scraper.fetch_rbc_data()
+
+        assert results == []
+
+    def test_run_rbc_creates_output_files(self, scraper, tmp_path):
+        fake_csv_url = "https://fake.example.com/corps.csv"
+
+        def side_effect(url, **kwargs):
+            if "package_show" in url:
+                return self._mock_ckan_response(fake_csv_url)
+            return self._mock_csv_response(RBC_SAMPLE_CSV)
+
+        with patch("csv_scraper.requests.get", side_effect=side_effect):
+            results = scraper.run_rbc(
+                csv_filename="rbc_test.csv",
+                json_filename="rbc_test.json",
+            )
+
+        assert len(results) > 0
+        assert os.path.exists(scraper.output_dir / "rbc_test.csv")
+        assert os.path.exists(scraper.output_dir / "rbc_test.json")
+
+    def test_run_rbc_output_fields_correct(self, scraper, tmp_path):
+        fake_csv_url = "https://fake.example.com/corps.csv"
+
+        def side_effect(url, **kwargs):
+            if "package_show" in url:
+                return self._mock_ckan_response(fake_csv_url)
+            return self._mock_csv_response(RBC_SAMPLE_CSV)
+
+        with patch("csv_scraper.requests.get", side_effect=side_effect):
+            results = scraper.run_rbc(csv_filename="rbc_out.csv", json_filename="rbc_out.json")
+
+        assert len(results) > 0
+        for field in OUTPUT_FIELDS:
+            assert field in results[0]
+
+    def test_resolve_csv_url_ckan_no_resources(self, scraper):
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {"result": {"resources": []}}
+
+        with patch("csv_scraper.requests.get", return_value=mock_resp):
+            url = scraper._resolve_csv_url_from_ckan()
+
+        assert url is None
