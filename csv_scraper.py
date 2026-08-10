@@ -98,6 +98,10 @@ OUTPUT_FIELDS = [
     "bank_name",
 ]
 
+# RBC-specific filtering
+RBC_KEYWORDS = ("rbc", "royal bank of canada")
+RBC_MAX_RECORDS = 800
+
 
 # ---------------------------------------------------------------------------
 # Helper utilities
@@ -136,6 +140,12 @@ def _clean_text(value) -> str:
     return "" if text.lower() in ("nan", "none", "n/a", "na", "") else text
 
 
+def _is_rbc_company(company_name: str) -> bool:
+    """Return True when the company name appears to be RBC-related."""
+    name = (company_name or "").lower()
+    return any(keyword in name for keyword in RBC_KEYWORDS)
+
+
 # ---------------------------------------------------------------------------
 # Core class
 # ---------------------------------------------------------------------------
@@ -154,7 +164,7 @@ class CSVDataScraper:
     def __init__(
         self,
         output_dir: str = "./output",
-        max_records: int = 2000,
+        max_records: int = RBC_MAX_RECORDS,
     ):
         """
         Args:
@@ -257,19 +267,21 @@ class CSVDataScraper:
         companies: List[Dict] = []
 
         for _, row in df.iterrows():
-            if len(companies) >= self.max_records:
-                break
-
             company = self._map_row(row, col_map)
             if not company.get("company_name"):
+                continue
+            if not _is_rbc_company(company["company_name"]):
                 continue
             if self._validate(company):
                 companies.append(company)
             else:
                 logger.debug("Skipping invalid row: %s", dict(row))
 
+            if len(companies) >= self.max_records:
+                break
+
         self.companies = companies
-        logger.info("Parsed %d valid companies from dataset.", len(companies))
+        logger.info("Parsed %d RBC-related companies from dataset.", len(companies))
         return companies
 
     def _guess_column_map(self, columns: List[str]) -> Dict[str, str]:
@@ -392,6 +404,15 @@ class CSVDataScraper:
         )
         return filtered
 
+    def filter_by_rbc(
+        self, companies: Optional[List[Dict]] = None
+    ) -> List[Dict]:
+        """Keep only RBC-related companies."""
+        data = companies if companies is not None else self.companies
+        filtered = [c for c in data if _is_rbc_company(c.get("company_name", ""))]
+        logger.info("filter_by_rbc(): %d → %d records", len(data), len(filtered))
+        return filtered
+
     # ------------------------------------------------------------------
     # Export
     # ------------------------------------------------------------------
@@ -459,6 +480,7 @@ class CSVDataScraper:
         filter_province: Optional[str] = None,
         filter_industry: Optional[str] = None,
         filter_status: Optional[str] = None,
+        rbc_only: bool = True,
         csv_filename: str = "companies_2k.csv",
         json_filename: str = "companies_2k.json",
     ) -> List[Dict]:
@@ -471,6 +493,7 @@ class CSVDataScraper:
             filter_province: If set, keep only this province.
             filter_industry: If set, keep only records matching this industry.
             filter_status:   If set, keep only records with this status.
+            rbc_only:        If True, keep only RBC-related companies.
             csv_filename:    Output CSV filename.
             json_filename:   Output JSON filename.
 
@@ -482,6 +505,8 @@ class CSVDataScraper:
 
         companies = self.parse_companies(column_map)
 
+        if rbc_only:
+            companies = self.filter_by_rbc(companies)
         if filter_province:
             companies = self.filter_by_province(filter_province, companies)
         if filter_industry:
@@ -522,12 +547,13 @@ def main():
     parser.add_argument("--province", help="Filter by province code (e.g. ON)")
     parser.add_argument("--industry", help="Filter by industry keyword")
     parser.add_argument("--status", default="Active", help="Filter by status (default: Active)")
-    parser.add_argument("--max", type=int, default=2000, help="Maximum records (default: 2000)")
+    parser.add_argument("--max", type=int, default=RBC_MAX_RECORDS, help="Maximum records (default: 800)")
+    parser.add_argument("--all-companies", action="store_true", help="Disable RBC-only filtering")
     parser.add_argument(
-        "--csv-out", default="companies_2k.csv", help="Output CSV filename"
+        "--csv-out", default="rbc_companies_800.csv", help="Output CSV filename"
     )
     parser.add_argument(
-        "--json-out", default="companies_2k.json", help="Output JSON filename"
+        "--json-out", default="rbc_companies_800.json", help="Output JSON filename"
     )
 
     args = parser.parse_args()
@@ -538,6 +564,7 @@ def main():
         filter_province=args.province,
         filter_industry=args.industry,
         filter_status=args.status,
+        rbc_only=not args.all_companies,
         csv_filename=args.csv_out,
         json_filename=args.json_out,
     )
