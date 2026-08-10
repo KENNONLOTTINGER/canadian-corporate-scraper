@@ -147,7 +147,7 @@ class CSVDataScraper:
     Workflow:
         1. Load CSV data from a URL or a local file path.
         2. Parse and normalise the rows into a canonical schema.
-        3. Optionally filter by province, industry, or status.
+        3. Optionally filter by province, industry, status, or company name.
         4. Export the results to CSV and/or JSON.
     """
 
@@ -392,6 +392,18 @@ class CSVDataScraper:
         )
         return filtered
 
+    def filter_by_company_name(
+        self, company_name: str, companies: Optional[List[Dict]] = None
+    ) -> List[Dict]:
+        """Filter companies by exact or partial company name match (case-insensitive)."""
+        data = companies if companies is not None else self.companies
+        needle = company_name.lower()
+        filtered = [c for c in data if needle in c.get("company_name", "").lower()]
+        logger.info(
+            "filter_by_company_name('%s'): %d → %d records", company_name, len(data), len(filtered)
+        )
+        return filtered
+
     # ------------------------------------------------------------------
     # Export
     # ------------------------------------------------------------------
@@ -459,6 +471,7 @@ class CSVDataScraper:
         filter_province: Optional[str] = None,
         filter_industry: Optional[str] = None,
         filter_status: Optional[str] = None,
+        filter_company_name: Optional[str] = None,
         csv_filename: str = "companies_2k.csv",
         json_filename: str = "companies_2k.json",
     ) -> List[Dict]:
@@ -466,13 +479,14 @@ class CSVDataScraper:
         Full pipeline: load → parse → filter → export.
 
         Args:
-            source_path:     Path to the input CSV file.
-            column_map:      Optional column mapping override.
-            filter_province: If set, keep only this province.
-            filter_industry: If set, keep only records matching this industry.
-            filter_status:   If set, keep only records with this status.
-            csv_filename:    Output CSV filename.
-            json_filename:   Output JSON filename.
+            source_path:         Path to the input CSV file.
+            column_map:          Optional column mapping override.
+            filter_province:     If set, keep only this province.
+            filter_industry:     If set, keep only records matching this industry.
+            filter_status:       If set, keep only records with this status.
+            filter_company_name: If set, keep only records matching this company name.
+            csv_filename:        Output CSV filename.
+            json_filename:       Output JSON filename.
 
         Returns:
             List of processed company dicts.
@@ -482,6 +496,8 @@ class CSVDataScraper:
 
         companies = self.parse_companies(column_map)
 
+        if filter_company_name:
+            companies = self.filter_by_company_name(filter_company_name, companies)
         if filter_province:
             companies = self.filter_by_province(filter_province, companies)
         if filter_industry:
@@ -519,6 +535,7 @@ def main():
         help="Path to the input CSV file (default: data/sample_companies.csv)",
     )
     parser.add_argument("--output-dir", default="./output", help="Output directory")
+    parser.add_argument("--company", help="Filter by company name (e.g. RBC)")
     parser.add_argument("--province", help="Filter by province code (e.g. ON)")
     parser.add_argument("--industry", help="Filter by industry keyword")
     parser.add_argument("--status", default="Active", help="Filter by status (default: Active)")
@@ -535,6 +552,7 @@ def main():
     scraper = CSVDataScraper(output_dir=args.output_dir, max_records=args.max)
     results = scraper.run(
         source_path=args.source,
+        filter_company_name=args.company,
         filter_province=args.province,
         filter_industry=args.industry,
         filter_status=args.status,
