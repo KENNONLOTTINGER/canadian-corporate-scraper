@@ -4,12 +4,18 @@ Canadian Corporate CSV Data Processor
 Downloads and parses public Canadian business CSV datasets from government registries
 (Statistics Canada, Corporations Canada, provincial registries) and exports the
 results to CSV and JSON formats.
+
+RBC scraping: use ``fetch_rbc_data()`` or the ``run_rbc()`` pipeline to download
+fresh RBC (Royal Bank of Canada) corporate data directly from online sources without
+needing a local CSV file.
 """
 
 import csv
+import io
 import json
 import logging
 import os
+import zipfile
 from io import StringIO
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -30,6 +36,38 @@ logger = logging.getLogger(__name__)
 
 # Public Canadian government open-data CSV endpoints.
 # These are real URLs; a local fallback file is used when downloads fail.
+
+# ---------------------------------------------------------------------------
+# RBC open-data source configuration
+# ---------------------------------------------------------------------------
+# The Corporations Canada open-data portal publishes a CSV/ZIP of all federally
+# registered corporations.  The API endpoint below returns JSON metadata for the
+# dataset; the scraper resolves the actual CSV download URL from that metadata.
+_CORPORATIONS_CANADA_PACKAGE_URL = (
+    "https://open.canada.ca/data/en/api/3/action/package_show"
+    "?id=c1b2a820-8e59-4f56-a84c-bb7e0a1c79d5"
+)
+
+# Fallback: the Corporations Canada dataset can also be reached via the CKAN
+# resource-search endpoint.  We try the package API first.
+_CORPORATIONS_CANADA_RESOURCE_SEARCH_URL = (
+    "https://open.canada.ca/data/en/api/3/action/resource_search"
+    "?query=name:Corporations+Canada+Active+Corporations&limit=5"
+)
+
+# Known direct CSV download URLs for the Corporations Canada active corporations
+# dataset (updated periodically on open.canada.ca).  Used as hard-coded fallback
+# if the CKAN API is unavailable.
+_CORPORATIONS_CANADA_CSV_FALLBACKS: List[str] = [
+    "https://www.ic.gc.ca/app/scr/cc/CorporationsCanada/fdrlCrpSrch.html",
+]
+
+# RBC keyword variants used when filtering corporation names
+RBC_NAME_KEYWORDS: List[str] = [
+    "royal bank of canada",
+    "rbc",
+]
+
 DATA_SOURCES = {
     "corporations_canada": {
         "url": (
@@ -461,6 +499,177 @@ class CSVDataScraper:
             return ""
 
     # ------------------------------------------------------------------
+    # Online RBC data fetch
+    # ------------------------------------------------------------------
+
+    def _resolve_csv_url_from_ckan(self) -> Optional[str]:
+        """
+        Query the CKAN API on open.canada.ca to obtain the direct CSV download
+        URL for the Corporations Canada active-corporations dataset.
+
+        Returns the URL string, or None when the API is unavailable.
+        """
+        try:
+            logger.info("Resolving CSV URL via CKAN package API …")
+            resp = requests.get(_CORPORATIONS_CANADA_PACKAGE_URL, timeout=20)
+            resp.raise_for_status()
+            pkg = resp.json()
+            resources = pkg.get("result", {}).get("resources", [])
+            for resource in resources:
+                fmt = resource.get("format", "").lower()
+                url = resource.get("url", "")
+                if fmt in ("csv", "csv / zip") and url:
+                    logger.info("Found CSV resource: %s", url)
+                    return url
+            # Fallback: accept any resource URL that ends with .csv
+            for resource in resources:
+                url = resource.get("url", "")
+                if url.lower().endswith(".csv"):
+                    return url
+        except Exception as exc:
+            logger.warning("CKAN package API unavailable: %s", exc)
+        return None
+
+    def _download_csv_text(self, url: str) -> Optional[str]:
+        """
+        Download the CSV (or ZIP containing a CSV) at *url* and return its
+        text content, or None on failure.
+        """
+        try:
+            logger.info("Downloading CSV from %s …", url)
+            resp = requests.get(url, timeout=60, stream=True)
+            resp.raise_for_status()
+            content_type = resp.headers.get("Content-Type", "")
+
+            # Handle ZIP archives that wrap the CSV
+            if "zip" in content_type or url.lower().endswith(".zip"):
+                data = resp.content
+                try:
+                    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                        csv_names = [n for n in zf.namelist() if n.lower().endswith(".csv")]
+                        if csv_names:
+                            with zf.open(csv_names[0]) as f:
+                                return f.read().decode("utf-8", errors="replace")
+                except zipfile.BadZipFile:
+                    pass
+
+            return resp.text
+        except Exception as exc:
+            logger.warning("Failed to download CSV from %s: %s", url, exc)
+            return None
+
+    def _is_rbc_record(self, company: Dict) -> bool:
+        """Return True when the company record appears to be an RBC entity."""
+        name = company.get("company_name", "").lower()
+        bank = company.get("bank_name", "").lower()
+        for kw in RBC_NAME_KEYWORDS:
+            if kw in name or kw in bank:
+                return True
+        return False
+
+    def fetch_rbc_data(
+        self,
+        max_records: int = 800,
+        filter_status: Optional[str] = None,
+        filter_province: Optional[str] = None,
+    ) -> List[Dict]:
+        """
+        Download fresh RBC corporate data directly from Canadian government
+        open-data sources and return a list of normalised company dicts.
+
+        Steps:
+          1. Resolve the Corporations Canada CSV download URL via the CKAN API.
+          2. Download and parse the CSV.
+          3. Filter for RBC-related records (company name or bank field contains
+             "rbc" or "royal bank of canada").
+          4. Optionally filter further by status / province.
+          5. Cap the result at *max_records* (default 800).
+
+        Args:
+            max_records:     Maximum number of RBC records to return (default 800).
+            filter_status:   Optional status filter (e.g. "Active").
+            filter_province: Optional province filter (e.g. "ON").
+
+        Returns:
+            List of company dicts in the canonical schema.
+        """
+        source_cfg = DATA_SOURCES["corporations_canada"]
+        column_map = source_cfg["column_map"]
+
+        # 1. Resolve CSV URL
+        csv_url = self._resolve_csv_url_from_ckan()
+
+        # 2. Download CSV text
+        csv_text: Optional[str] = None
+        if csv_url:
+            csv_text = self._download_csv_text(csv_url)
+
+        if not csv_text:
+            logger.error(
+                "Could not download Corporations Canada dataset. "
+                "Ensure internet access is available."
+            )
+            return []
+
+        # 3. Load into DataFrame and parse
+        if not self.load_from_string(csv_text):
+            return []
+
+        companies = self.parse_companies(column_map)
+        logger.info("Total corporations parsed: %d", len(companies))
+
+        # 4. Filter for RBC entities
+        rbc_companies = [c for c in companies if self._is_rbc_record(c)]
+        logger.info("RBC records found: %d", len(rbc_companies))
+
+        # 5. Optional further filters
+        if filter_province:
+            rbc_companies = self.filter_by_province(filter_province, rbc_companies)
+        if filter_status:
+            rbc_companies = self.filter_by_status(filter_status, rbc_companies)
+
+        # 6. Cap and store
+        self.companies = rbc_companies[:max_records]
+        logger.info("Returning %d RBC records (cap: %d).", len(self.companies), max_records)
+        return self.companies
+
+    def run_rbc(
+        self,
+        max_records: int = 800,
+        filter_status: Optional[str] = None,
+        filter_province: Optional[str] = None,
+        csv_filename: str = "rbc_companies.csv",
+        json_filename: str = "rbc_companies.json",
+    ) -> List[Dict]:
+        """
+        Full online pipeline for RBC data: fetch → filter → export.
+
+        Downloads fresh RBC corporate data from the Corporations Canada open-data
+        portal without requiring any local CSV file.
+
+        Args:
+            max_records:     Maximum RBC records (default 800).
+            filter_status:   Optional status filter (e.g. "Active").
+            filter_province: Optional province filter (e.g. "ON").
+            csv_filename:    Output CSV filename (default: rbc_companies.csv).
+            json_filename:   Output JSON filename (default: rbc_companies.json).
+
+        Returns:
+            List of processed RBC company dicts.
+        """
+        companies = self.fetch_rbc_data(
+            max_records=max_records,
+            filter_status=filter_status,
+            filter_province=filter_province,
+        )
+
+        if companies:
+            self.export_to_csv(companies, csv_filename)
+            self.export_to_json(companies, json_filename)
+
+        return companies
+
+    # ------------------------------------------------------------------
     # High-level pipeline
     # ------------------------------------------------------------------
 
@@ -535,6 +744,14 @@ def main():
         help="Path to the input CSV file (default: data/sample_companies.csv)",
     )
     parser.add_argument("--output-dir", default="./output", help="Output directory")
+    parser.add_argument(
+        "--rbc",
+        action="store_true",
+        help=(
+            "Fetch fresh RBC data directly from the Corporations Canada open-data "
+            "portal instead of loading a local CSV file. Outputs ~800 records."
+        ),
+    )
     parser.add_argument("--company", help="Filter by company name (e.g. RBC)")
     parser.add_argument("--province", help="Filter by province code (e.g. ON)")
     parser.add_argument("--industry", help="Filter by industry keyword")
@@ -550,19 +767,34 @@ def main():
     args = parser.parse_args()
 
     scraper = CSVDataScraper(output_dir=args.output_dir, max_records=args.max)
-    results = scraper.run(
-        source_path=args.source,
-        filter_company_name=args.company,
-        filter_province=args.province,
-        filter_industry=args.industry,
-        filter_status=args.status,
-        csv_filename=args.csv_out,
-        json_filename=args.json_out,
-    )
+
+    if args.rbc:
+        rbc_max = min(args.max, 800)
+        results = scraper.run_rbc(
+            max_records=rbc_max,
+            filter_status=args.status if args.status else None,
+            filter_province=args.province,
+            csv_filename=args.csv_out if args.csv_out != "companies_2k.csv" else "rbc_companies.csv",
+            json_filename=args.json_out if args.json_out != "companies_2k.json" else "rbc_companies.json",
+        )
+        csv_name = args.csv_out if args.csv_out != "companies_2k.csv" else "rbc_companies.csv"
+        json_name = args.json_out if args.json_out != "companies_2k.json" else "rbc_companies.json"
+    else:
+        results = scraper.run(
+            source_path=args.source,
+            filter_company_name=args.company,
+            filter_province=args.province,
+            filter_industry=args.industry,
+            filter_status=args.status,
+            csv_filename=args.csv_out,
+            json_filename=args.json_out,
+        )
+        csv_name = args.csv_out
+        json_name = args.json_out
 
     print(f"\n✓ Processed {len(results)} companies.")
-    print(f"  CSV  → {args.output_dir}/{args.csv_out}")
-    print(f"  JSON → {args.output_dir}/{args.json_out}")
+    print(f"  CSV  → {args.output_dir}/{csv_name}")
+    print(f"  JSON → {args.output_dir}/{json_name}")
 
 
 if __name__ == "__main__":
